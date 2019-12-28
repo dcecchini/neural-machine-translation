@@ -14,7 +14,9 @@ from keras.preprocessing.text import Tokenizer
 from keras.preprocessing.sequence import pad_sequences
 from keras.utils.np_utils import to_categorical
 from keras.models import Sequential
-from keras.layers import Embedding, Dense, RepeatVector, TimeDistributed, Bidirectional
+from keras.layers import Embedding, Dense, RepeatVector, TimeDistributed, Bidirectional, Dropout
+from keras.losses import sparse_categorical_crossentropy
+from keras.optimizers import Adam
 import numpy as np
 import pickle
 from keras.callbacks import ModelCheckpoint
@@ -24,16 +26,16 @@ from sklearn.model_selection import train_test_split
 
 
 # Hyper Parameters
-WORDVEC_DIM = 100
+WORDVEC_DIM = 128
 EPOCHS = 100
 BATCH_SIZE = 64
 TEST_SIZE=0.2
 INPUT_COLUMN = 0  # Use English as input: 0, use Portugues: 1
 TARGET_COLUMN = 1 # Use English as input: 0, use Portugues: 1
-
-MAX_VOCAB_SIZE = 5000 # Limit the vocabulary size for memory resons
+LEARNING_RATE = 0.003
+MAX_VOCAB_SIZE = 8000 # Limit the vocabulary size for memory resons
 OOV_TOKEN = r"<OOV>" # Out of vocabulary token
-
+SAMPLE_SIZE = 20000
 
 def load_anki(filename):
     """Loads the anki file and removes punctiation
@@ -196,7 +198,7 @@ def evaluate_model( model, new_data, input_tokenizer, input_length, target_token
         # translate encoded source text
         source = source.reshape((1, source.shape[0]))
         translation = predict_sequence(model, source, target_ix_to_word)
-        raw_target, raw_src = raw_dataset[i]
+        raw_target, raw_src = new_data[i]
         if print_examples:
             if i < 10:
                 print('src=[%s], target=[%s], predicted=[%s]' % (raw_src, raw_target, translation))
@@ -240,10 +242,10 @@ def prep_tokenizers(anki, max_vocab_size=None, oov_token=None, name_modifier="to
     """
 
     # prepare english tokenizer
-    input_tokenizer = create_tokenizer(anki[:, INPUT_COLUMN])
+    input_tokenizer = create_tokenizer(anki[:, INPUT_COLUMN], max_vocab_size=max_vocab_size, oov_token=oov_token)
 
     # prepare Portuguese tokenizer
-    target_tokenizer = create_tokenizer(anki[:, TARGET_COLUMN])
+    target_tokenizer = create_tokenizer(anki[:, TARGET_COLUMN], max_vocab_size=max_vocab_size, oov_token=oov_token)
 
     with(open('data/input_{}.pickle'.format(name_modifier), 'wb')) as f:
         pickle.dump(input_tokenizer, f)
@@ -273,20 +275,20 @@ def build_model(input_vocab_size, input_length, target_vocab_size, target_length
 
     # Encoder
     model.add(Embedding(input_vocab_size, WORDVEC_DIM, input_length=input_length, mask_zero=True))
-    model.add(Bidirectional(LSTM(128)))
+    model.add(Bidirectional(LSTM(512, dropout=0.1, recurrent_dropout=0.1)))
     model.add(RepeatVector(target_length))
 
     # Decoder
-    model.add(LSTM(256, return_sequences=True))
+    model.add(LSTM(256, dropout=0.1, recurrent_dropout=0.1, return_sequences=True))
     model.add(TimeDistributed(Dense(target_vocab_size, activation='softmax')))
 
     # Compile: The loss is as a multiclass classification
-    model.compile(optimizer='adam', loss='categorical_crossentropy')
+    model.compile(optimizer=Adam(LEARNING_RATE), loss="categorical_crossentropy")
 
     return model
 
 
-def train_model(train, input_tokenizer, input_length, target_tokenizer, target_length):
+def train_model(train, input_tokenizer, input_length, target_tokenizer, target_length, model_name):
     """Train the RNN model
     """
 
@@ -310,7 +312,7 @@ def train_model(train, input_tokenizer, input_length, target_tokenizer, target_l
     # Train the model
     model.fit(X_train, Y_train, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=1) # callbacks=[checkpoint]
 
-    model.save_weights('data/rnn_model_weights.h5')
+    model.save_weights('data/{}.h5'.format(model_name))
 
     return model
 
@@ -342,16 +344,21 @@ if __name__ == "__main__":
     # Get the data, remove punctuation
     anki = prep_anki(r"data/en2pt.txt", sample=None)
 
-    # Make sample with custom sizes: at least 3 words, no more than 6
-    mask = np.array([(len(a.split()) >= 3) & (len(a.split()) <= 6) for (a,b) in zip(anki[:,0], anki[:, 1])], dtype=bool)
+    MIN_WORDS = 5
+    MAX_WORDS = 5
+    # Make sample with custom sizes: at least MIN_WORDS words, no more than MAX_WORDS
+    mask = np.array([(len(a.split()) >= MIN_WORDS) & (len(a.split()) <= MAX_WORDS) & (len(b.split()) >= MIN_WORDS) & (len(b.split()) <= MAX_WORDS) for (a,b) in zip(anki[:,0], anki[:, 1])], dtype=bool)
 
     anki_sample = anki[mask, :]
-    np.save("data/en2pt_3to6words_10k.npy", anki_sample)
+    np.save("data/en2pt_{0}to{1}words.npy".format(MIN_WORDS, MAX_WORDS), anki_sample)
 
-    anki_sample = anki_sample[np.random.choice(anki_sample.shape[0], 10000, replace=False), :]
+    anki_sample = anki_sample[np.random.choice(anki_sample.shape[0], min(SAMPLE_SIZE, anki_sample.shape[0]), replace=False), :]
 
     # Creae the tokenizers objects
-    input_tokenizer, target_tokenizer = prep_tokenizers(anki_sample, MAX_VOCAB_SIZE, OOV_TOKEN, name_modifier="tokenizer_3to6_10k")
+    input_tokenizer, target_tokenizer = prep_tokenizers(anki_sample, MAX_VOCAB_SIZE, OOV_TOKEN, name_modifier="tokenizer_{0}to{1}_{2}k".format(MIN_WORDS, MAX_WORDS, str(int(SAMPLE_SIZE/1000))))
+
+    # Load saved variables for testing
+    # anki_sample, input_length, target_length, input_tokenizer, target_tokenizer, model = load_variables("data/en2pt_{0}to{1}words_{2}k.npy", "data/rnn_model3_weights.h5", "data/input_tokenizer_{0}to{1}_{2}k.pickle", "data/target_tokenizer_{0}to{1}_{2}k.pickle".format(MIN_WORDS, MAX_WORDS, str(int(SAMPLE_SIZE/1000))))
 
     # Get maximim length of phrases to standardize all inputs to the same length (padding)
     input_length = max([len(line.split()) for line in anki_sample[:, INPUT_COLUMN]])
@@ -361,7 +368,7 @@ if __name__ == "__main__":
     train, test = train_test_split(anki_sample, test_size=TEST_SIZE)
 
     # Define and train the model
-    model = train_model(train, input_tokenizer, input_length, target_tokenizer, target_length)
+    model = train_model(train, input_tokenizer, input_length, target_tokenizer, target_length, model_name="rnn_model_{0}to{1}_weights".format(MIN_WORDS, MAX_WORDS))
 
     # Evaluate the model
     bleu_scores = evaluate_model(model, test, input_tokenizer, input_length, target_tokenizer, target_length, print_examples=True)
