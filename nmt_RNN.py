@@ -3,11 +3,12 @@
 RNN for language modeling: Neural Machine Translation
 
 @author: David Cecchini
-@author2: Stece Beattie
+@author2: Steve Beattie
 """
 
 
 import re
+import os
 from keras.layers.recurrent import LSTM
 from keras.initializers import Constant
 from keras.preprocessing.text import Tokenizer
@@ -37,7 +38,7 @@ MAX_VOCAB_SIZE = 8000 # Limit the vocabulary size for memory resons
 OOV_TOKEN = r"<OOV>" # Out of vocabulary token
 SAMPLE_SIZE = 20000
 
-def load_anki(filename):
+def load_anki(filename, tolower=True, remove_punct=True):
     """Loads the anki file and removes punctiation
 
     Open the Anki file with the examples of translation phrases from both languages.
@@ -55,25 +56,29 @@ def load_anki(filename):
         text = file.read()
 
     # Transform to lower case
-    text = text.lower()
+    if tolower:
+        text = text.lower()
 
     # Separete lines and languages
     lines = text.strip().split('\n')
+    pairs = [line.split('\t') for line in lines]
 
     # Remove punctuation
-    rem_punct = re.compile('\W+')
-    pairs = [line.split('\t') for line in lines]
-    cleaned = list()
-    for pair in pairs:
-        clean_pair = list()
-        for line in pair:
-            line = line.split(' ')
-            line = [rem_punct.sub('', w) for w in line]
-            # remove tokens with numbers in them
-            line = [word for word in line if word.isalpha()]
-            clean_pair.append(' '.join(line))
-        cleaned.append(clean_pair)
-    return np.array(cleaned)
+    if remove_punct:
+        rem_punct = re.compile('\W+')
+        cleaned = list()
+        for pair in pairs:
+            clean_pair = list()
+            for line in pair:
+                line = line.split(' ')
+                line = [rem_punct.sub('', w) for w in line]
+                # remove tokens with numbers in them
+                line = [word for word in line if word.isalpha()]
+                clean_pair.append(' '.join(line))
+            cleaned.append(clean_pair)
+        return np.array(cleaned)
+    else:
+        return np.array(pairs)
 
 
 # fit a tokenizer
@@ -283,7 +288,7 @@ def build_model(input_vocab_size, input_length, target_vocab_size, target_length
     model.add(TimeDistributed(Dense(target_vocab_size, activation='softmax')))
 
     # Compile: The loss is as a multiclass classification
-    model.compile(optimizer=Adam(LEARNING_RATE), loss="categorical_crossentropy")
+    model.compile(optimizer=Adam(LEARNING_RATE), loss="categorical_crossentropy", metrics=["accuracy"])
 
     return model
 
@@ -337,6 +342,116 @@ def load_variables(data_filename, model_weights, input_tok_name, target_tok_name
     model.load_weights(model_weights)
 
     return (anki, input_length, target_length, input_tokenizer, target_tokenizer, model)
+
+
+def main(input_lang="en", target_lang="pt", name_modifier="moses_preprocessed", print_examples=True):
+    # Read the files
+    with(open(os.path.join("data", "train.{}.atok".format(input_lang)), "r")) as f:
+        input_texts_train = f.read().strip().split("\n")
+
+    with(open(os.path.join("data", "train.{}.atok".format(target_lang)), "r")) as f:
+        target_texts_train = f.read().strip().split("\n")
+
+    with(open(os.path.join("data", "val.{}.atok".format(input_lang)), "r")) as f:
+        input_texts_val = f.read().strip().split("\n")
+
+    with(open(os.path.join("data", "val.{}.atok".format(target_lang)), "r")) as f:
+        target_texts_val = f.read().strip().split("\n")
+
+    with(open(os.path.join("data", "test.{}.atok".format(input_lang)), "r")) as f:
+        input_texts_test = f.read().strip().split("\n")
+
+    with(open(os.path.join("data", "test.{}.atok".format(target_lang)), "r")) as f:
+        target_texts_test = f.read().strip().split("\n")
+
+    # # Put train and validation together
+    # input_texts_train = input_texts_train + input_texts_val
+    # target_texts_train = target_texts_train + target_texts_val
+    # del input_texts_val, target_texts_val
+
+    # Create the tokenizers
+    input_tokenizer = create_tokenizer(input_texts_train, max_vocab_size=MAX_VOCAB_SIZE, oov_token=OOV_TOKEN)
+    target_tokenizer = create_tokenizer(target_texts_train, max_vocab_size=MAX_VOCAB_SIZE, oov_token=OOV_TOKEN)
+
+    # Save tokenizers
+    with(open(os.path.join('data', 'input_tokenizer_{}.pickle'.format(name_modifier)), 'wb')) as f:
+        pickle.dump(input_tokenizer, f)
+
+    with(open('data/target_tokenizer_{}.pickle'.format(name_modifier), 'wb')) as f:
+        pickle.dump(target_tokenizer, f)
+
+    # Get maximum length of phrases to standardize all inputs to the same length (padding)
+    input_length = max([len(line.split()) for line in input_texts_train])
+    target_length = max([len(line.split()) for line in target_texts_train])
+
+    # Get the size of the vocabularies
+    input_vocab_size = len(input_tokenizer.word_index) + 1   # Add one for <PAD> token
+    target_vocab_size = len(target_tokenizer.word_index) + 1 # Add one for <PAD> token
+
+    # Define and train the model
+    model = build_model(input_vocab_size, input_length, target_vocab_size, target_length)
+
+    # Encode and pad texts
+    X_train = encode_sequences(input_texts_train, input_tokenizer, input_length)
+    Y_train = encode_sequences(target_texts_train, target_tokenizer, target_length)
+    Y_train = encode_output(Y_train, target_vocab_size)
+
+    X_val = encode_sequences(input_texts_val, input_tokenizer, input_length)
+    Y_val = encode_sequences(target_texts_val, target_tokenizer, target_length)
+    Y_val = encode_output(Y_val, target_vocab_size)
+
+    # Train the model
+    history = model.fit(X_train, Y_train, validation_data=(X_val, Y_val), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=1) # callbacks=[checkpoint]
+    model.save_weights("rnn_model_{}_weights".format(name_modifier))
+
+    # Free some memory
+    del X_train, Y_train, X_val, Y_val
+
+    # Get dictionary {index:word}
+    target_ix_to_word = {k:w for w,k in target_tokenizer.word_index.items()}
+
+    # Evaluate the model
+    # prepare validation data
+    X_test = encode_sequences(input_texts_test, input_tokenizer, input_length)
+    Y_test = encode_sequences(target_texts_test, target_tokenizer, target_length)
+    Y_test = encode_output(Y_test, target_vocab_size)
+
+    predicted = list()
+    for i, source in enumerate(X_test):
+        # translate encoded source text
+        source = source.reshape((1, source.shape[0]))
+        translation = predict_sequence(model, source, target_ix_to_word)
+        predicted.append(translation)
+
+    bleu_1 = corpus_bleu(target_texts_test, predicted, weights=(1.0, 0, 0, 0))
+    bleu_2 = corpus_bleu(target_texts_test, predicted, weights=(0.5, 0.5, 0, 0))
+    bleu_3 = corpus_bleu(target_texts_test, predicted, weights=(0.3, 0.3, 0.3, 0))
+    bleu_4 = corpus_bleu(target_texts_test, predicted, weights=(0.25, 0.25, 0.25, 0.25))
+
+    # Save BLEU scores
+    with(open(os.path.join("data", "bleu_scores.txt"), "w")) as f:
+        f.write("BLEU 1 score: {}\n".format(bleu_1))
+        f.write("BLEU 2 score: {}\n".format(bleu_2))
+        f.write("BLEU 3 score: {}\n".format(bleu_3))
+        f.write("BLEU 4 score: {}\n".format(bleu_4))
+
+    if print_examples:
+        print("Printing {} examples:".format(10))
+        for i in np.random.randint(len(target_texts_test), size=10):# range(len(args.printn)):
+            print('src=[%s], target=[%s], predicted=[%s]' % (input_texts_test[i], target_texts_test[i], predicted[i]))
+
+        # df = pd.DataFrame({'source': src, 'target': ytrue, 'predicted': pred})
+        # print(df.sample(n=args.printn))
+
+        print("\n\nAchieving the BLEU scores:\n")
+        # calculate BLEU score
+        print('BLEU-1: %f' % bleu_1)
+        print('BLEU-2: %f' % bleu_2)
+        print('BLEU-3: %f' % bleu_3)
+        print('BLEU-4: %f' % bleu_4)
+
+    return history
+
 
 
 if __name__ == "__main__":
